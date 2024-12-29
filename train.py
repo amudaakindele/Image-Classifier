@@ -17,13 +17,27 @@ from utils import save_checkpoint, load_checkpoint
 
 def parse_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Training process")
+    parser = argparse.ArgumentParser(description="Train a neural network on a dataset using transfer learning.")
+    
+    # Dataset directory
     parser.add_argument('--data_dir', required=True, help="Path to the dataset directory.")
-    parser.add_argument('--arch', default='vgg19', choices=['vgg13', 'vgg19'], help="Model architecture.")
-    parser.add_argument('--learning_rate', type=float, default=0.01, help="Learning rate.")
-    parser.add_argument('--hidden_units', type=int, default=512, help="Number of hidden units.")
-    parser.add_argument('--epochs', type=int, default=8, help="Number of epochs.")
-    parser.add_argument('--gpu', action="store_true", help="Enable GPU training.")
+    
+    # Model architecture
+    parser.add_argument(
+        '--arch',
+        default='vgg19',
+        choices=['vgg13', 'vgg16', 'vgg19', 'resnet18', 'resnet50', 'densenet121'],
+        help="Choose the pre-trained model architecture. Default is 'vgg19'."
+    )
+    
+    # Hyperparameters
+    parser.add_argument('--learning_rate', type=float, default=0.01, help="Learning rate for training. Default is 0.01.")
+    parser.add_argument('--hidden_units', type=int, default=512, help="Number of hidden units in the classifier. Default is 512.")
+    parser.add_argument('--epochs', type=int, default=8, help="Number of training epochs. Default is 8.")
+    
+    # Hardware configuration
+    parser.add_argument('--gpu', action="store_true", help="Enable GPU training if available.")
+    
     return parser.parse_args()
 
 def train(model, criterion, optimizer, dataloaders, epochs, gpu):
@@ -76,12 +90,26 @@ def main():
     """Main function to set up data, model, and training."""
     args = parse_args()
 
-    # Data directories
-    train_dir = f"{args.data_dir}/train"
-    valid_dir = f"{args.data_dir}/valid"
-    test_dir = f"{args.data_dir}/test"
+    # Load datasets and dataloaders
+    train_dir, valid_dir, test_dir = [
+        f"{args.data_dir}/{x}" for x in ['train', 'valid', 'test']
+    ]
+    datasets, dataloaders = prepare_data(train_dir, valid_dir, test_dir)
 
-    # Data transformations
+    # Build and configure the model
+    model = build_model(args.arch, args.hidden_units, num_classes=102)
+    optimizer = optim.SGD(model.classifier.parameters(), lr=args.learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    # Train the model
+    train(model, criterion, optimizer, dataloaders, args.epochs, args.gpu)
+
+    # Save the model checkpoint
+    model.class_to_idx = datasets['train'].class_to_idx
+    save_checkpoint(model, optimizer, args)
+
+def prepare_data(train_dir, valid_dir, test_dir):
+    """Prepares datasets and dataloaders for training, validation, and testing."""
     data_transforms = {
         'train': transforms.Compose([
             transforms.RandomRotation(30),
@@ -104,44 +132,72 @@ def main():
         ])
     }
 
- 
-    image_datasets = {
-        x: ImageFolder(f"{args.data_dir}/{x}", transform=data_transforms[x])
-        for x in ['train', 'valid', 'test']
+    datasets = {
+        phase: ImageFolder(directory, transform=data_transforms[phase])
+        for phase, directory in zip(['train', 'valid', 'test'], [train_dir, valid_dir, test_dir])
     }
 
     dataloaders = {
-        x: torch.utils.data.DataLoader(image_datasets[x], batch_size=64, shuffle=(x == 'train'))
-        for x in ['train', 'valid', 'test']
+        phase: torch.utils.data.DataLoader(
+            datasets[phase], batch_size=64, shuffle=(phase == 'train')
+        )
+        for phase in ['train', 'valid', 'test']
     }
 
-    # Load pre-trained model
-    model = getattr(models, args.arch)(pretrained=True)
+    return datasets, dataloaders
 
+def build_model(architecture, hidden_units, num_classes=102):
+    """Builds a pre-trained model with a custom classifier."""
+    model = getattr(models, architecture)(pretrained=True)
+
+    # Freeze feature extraction layers
     for param in model.parameters():
         param.requires_grad = False
 
-    feature_num = model.classifier[0].in_features
-    classifier = nn.Sequential(OrderedDict([
-        ('fc1', nn.Linear(feature_num, args.hidden_units)),
-        ('relu', nn.ReLU()),
-        ('drop', nn.Dropout(p=0.5)),
-        ('fc2', nn.Linear(args.hidden_units, 102)),
-        ('output', nn.LogSoftmax(dim=1))
-    ]))
+    # Configure classifier
+    if hasattr(model, 'classifier'):
+        feature_num = model.classifier[0].in_features
+        classifier = nn.Sequential(OrderedDict([
+            ('fc1', nn.Linear(feature_num, hidden_units)),
+            ('relu', nn.ReLU()),
+            ('drop', nn.Dropout(p=0.5)),
+            ('fc2', nn.Linear(hidden_units, num_classes)),
+            ('output', nn.LogSoftmax(dim=1))
+        ]))
+        model.classifier = classifier
 
-    model.classifier = classifier
+    elif hasattr(model, 'fc'):
+        feature_num = model.fc.in_features
+        classifier = nn.Sequential(OrderedDict([
+            ('fc1', nn.Linear(feature_num, hidden_units)),
+            ('relu', nn.ReLU()),
+            ('drop', nn.Dropout(p=0.5)),
+            ('fc2', nn.Linear(hidden_units, num_classes)),
+            ('output', nn.LogSoftmax(dim=1))
+        ]))
+        model.fc = classifier
 
- 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.classifier.parameters(), lr=args.learning_rate)
+    else:
+        raise ValueError(f"Unsupported architecture: {architecture}")
 
-    # Train the model
-    train(model, criterion, optimizer, dataloaders, args.epochs, args.gpu)
+    return model
 
-    # Save the model checkpoint
-    model.class_to_idx = image_datasets['train'].class_to_idx
-    save_checkpoint(model, optimizer, args, classifier)
+def save_checkpoint(model, optimizer, args):
+    """Saves a model checkpoint."""
+    checkpoint = {
+        'input_size': model.classifier[0].in_features if hasattr(model, 'classifier') else model.fc[0].in_features,
+        'output_size': 102,
+        'hidden_units': args.hidden_units,
+        'state_dict': model.state_dict(),
+        'class_to_idx': model.class_to_idx,
+        'optimizer_state': optimizer.state_dict(),
+        'epochs': args.epochs,
+        'architecture': args.arch
+    }
+
+    torch.save(checkpoint, 'checkpoint.pth')
+    print("Checkpoint saved successfully!")
+
 
 if __name__ == "__main__":
     main()
